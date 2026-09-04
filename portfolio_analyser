@@ -1,0 +1,429 @@
+"""
+Financial Portfolio Analysis Dashboard
+=====================================
+Demonstrates data manipulation, basic visualization, and understanding of portfolio metrics.
+Shows ability to handle real-world financial data and communicate insights visually.
+"""
+
+import sys
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from scipy.optimize import minimize
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set page configuration
+st.set_page_config(
+    layout="wide",
+    page_title="Portfolio Analyzer",
+    initial_sidebar_state="expanded"
+)
+
+# Page title and description
+st.title("📊 Financial Portfolio Analysis Dashboard")
+st.markdown("""
+This dashboard demonstrates portfolio analysis using Modern Portfolio Theory (MPT). 
+Users can select assets, adjust weights, and see how changes impact risk/return trade-offs in real-time.
+""")
+
+# Sidebar for configuration
+st.sidebar.header("Configuration")
+
+# Asset selection
+asset_names = st.sidebar.selectbox(
+    "Select Assets", 
+    ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA"],
+    default=["AAPL", "MSFT", "GOOGL"]
+)
+
+# Time period selection
+start_date = st.sidebar.date_input(
+    "Start Date", 
+    value=pd.Timestamp("2018-01-01")
+)
+end_date = st.sidebar.date_input(
+    "End Date", 
+    value="today"
+)
+
+# Risk-free rate for Sharpe ratio calculation
+risk_free_rate = st.sidebar.slider(
+    "Risk-Free Rate (annual)", 
+    min=0.0, 
+    max=0.1, 
+    step=0.005, 
+    value=0.02
+)
+
+
+def fetch_data(tickers, start_date, end_date):
+    """Fetch historical stock data from Yahoo Finance."""
+    st.write(f"Fetching data for {tickers}...")
+    
+    try:
+        stocks = yf.download(tickers, start=start_date, end=end_date, progress=False)
+        
+        if len(stocks.columns) == 1:
+            stocks = stocks[[stocks.columns[0]]]
+            
+        return stocks['Close']
+    except Exception as e:
+        st.error(f"Error fetching data: {str(e)}")
+        return pd.DataFrame()
+
+
+def calculate_returns(prices):
+    """Calculate daily returns."""
+    returns = prices.pct_change().dropna()
+    return returns
+
+
+def calculate_portfolio_metrics(portfolio_returns, weights, risk_free_rate):
+    """Calculate key portfolio metrics."""
+    mean_return = portfolio_returns.mean() * 252  # Annualized
+    volatility = portfolio_returns.std() * np.sqrt(252)  # Annualized
+    
+    # Sharpe Ratio (assuming annual frequency)
+    sharpe_ratio = (mean_return - risk_free_rate) / volatility if volatility > 0 else 0
+    
+    # Maximum Drawdown
+    cumulative_returns = (1 + portfolio_returns).cumprod()
+    rolling_max = cumulative_returns.cummax()
+    drawdown = (cumulative_returns - rolling_max) / rolling_max
+    max_drawdown = drawdown.min() * 252  # Annualized approximation
+    
+    return {
+        'Annual Return': mean_return,
+        'Volatility': volatility,
+        'Sharpe Ratio': sharpe_ratio,
+        'Max Drawdown': max_drawdown
+    }
+
+
+def calculate_covariance_matrix(returns):
+    """Calculate covariance matrix."""
+    return returns.cov() * 252  # Annualized covariance
+
+
+def calculate_betas(returns_data):
+    """Calculate beta for each asset against SPY as market proxy."""
+    try:
+        spy = yf.download("SPY", progress=False)
+        if len(spy.columns) == 1:
+            spy = spy[[spy.columns[0]]]
+        
+        spyn_returns = spy['Close'].pct_change().dropna()
+        beta = {}
+        
+        for ticker in returns_data.index:
+            asset_returns = returns_data[ticker].pct_change().dropna()
+            
+            # Calculate beta using linear regression
+            beta[ticker] = np.corrcoef(asset_returns, spyn_returns)[0, 1] / np.corrcoef(spyn_returns, spyn_returns)[0, 1]
+        
+        return beta
+    except Exception as e:
+        st.error(f"Error calculating betas: {str(e)}")
+        return {}
+
+
+def minimize_risk(weights, cov_matrix):
+    """Minimize portfolio variance subject to constraints."""
+    try:
+        # Constraints: weights sum to 1 and are non-negative
+        bounds = [(0, 1)] * len(weights)
+        
+        result = minimize(
+            lambda w: np.dot(w, np.dot(cov_matrix, w)),
+            w0=np.ones(len(weights)) / len(weights),
+            method='SLSQP',
+            bounds=bounds,
+            options={'maxiter': 1000}
+        )
+        
+        return result.x
+    except Exception as e:
+        st.error(f"Optimization error: {str(e)}")
+        return np.ones(len(weights)) / len(weights)
+
+
+def efficient_frontier(returns_data, n_points=100):
+    """Generate efficient frontier points."""
+    try:
+        cov_matrix = calculate_covariance_matrix(returns_data)
+        
+        # Generate random weights that sum to 1 and are positive
+        from numpy.random import random
+        
+        frontier_returns = []
+        frontier_volatilities = []
+        frontier_weights = []
+        
+        for _ in range(n_points):
+            # Generate random positive weights
+            w = random.dirichlet(np.ones(len(returns_data))) * 10
+            
+            # Normalize to ensure they sum to 1
+            w = w / w.sum()
+            
+            # Calculate return and volatility of this portfolio
+            mean_returns = returns_data.mean() * 252
+            portfolio_volatility = np.sqrt(np.dot(w, np.dot(cov_matrix, w)))
+            
+            frontier_returns.append(mean_returns)
+            frontier_volatilities.append(portfolio_volatility)
+            frontier_weights.append(w)
+        
+        return frontier_returns, frontier_volatilities, frontier_weights
+        
+    except Exception as e:
+        st.error(f"Efficient frontier calculation error: {str(e)}")
+        return [], [], []
+
+
+def plot_risk_return_scatter(returns_data, weights):
+    """Plot individual asset risk-return characteristics."""
+    fig = go.Figure()
+    
+    for ticker in returns_data.index:
+        ticker_returns = returns_data[ticker]
+        
+        # Calculate metrics for each asset
+        return_val = ticker_returns.mean() * 252
+        vol_val = ticker_returns.std() * np.sqrt(252)
+        
+        fig.add_trace(go.Scatter(
+            x=vol_val, 
+            y=return_val, 
+            mode='markers+text',
+            text=ticker,
+            textposition="top center",
+            marker=dict(size=15, color='#FF6384'),
+            name=f'{ticker} (β={np.random.beta[ticker]:.2f})') if 'beta' in locals() else '',
+            hovertemplate='<b>%{text}</b><br>Return: %{y:.2f}%<br>Volatility: %{x:.2f}%<extra></extra>'
+            )
+    
+    fig.update_layout(
+        title="Risk-Return Characteristics of Individual Assets",
+        xaxis_title="Annual Volatility",
+        yaxis_title="Annual Return (%)",
+        hovermode='closest'
+    )
+    
+    return fig
+
+
+def plot_efficient_frontier(frontier_returns, frontier_volatilities, optimal_weights, returns_data):
+    """Plot the efficient frontier."""
+    fig = go.Figure()
+    
+     
+    # Ensure frontier_returns and frontier_volatilities are numpy arrays
+    frontier_returns = np.array(frontier_returns)
+    frontier_volatilities = np.array(frontier_volatilities)
+    
+    # Calculate the expected return of individual assets from `returns_data`
+    asset_returns = returns_data.mean() * 252
+    
+    # Plot individual assets on the frontier
+    fig = go.Figure()
+    
+    for ticker in returns_data.columns:
+        asset_return = asset_returns[ticker]
+        asset_volatility = returns_data[ticker].std() * np.sqrt(252)
+        
+        fig.add_trace(go.Scatter(
+            x=[asset_volatility],
+            y=[asset_return],
+            mode='markers+text',
+            text=ticker,
+            marker=dict(size=10, color='#37479D'),
+            name=f'{ticker}'
+        ))
+    
+    # Plot efficient frontier curve
+    fig.add_trace(go.Scatter(
+        x=frontier_volatilities,
+        y=frontier_returns,
+        mode='lines',
+        line=dict(color='#1f77b4', width=2),
+        name="Efficient Frontier"
+    ))
+    
+    # Plot optimal portfolio
+    if isinstance(optimal_weights, (float, int)):
+        fig.add_trace(go.Scatter(
+            x=[frontier_volatilities[optimal_weights]],
+            y=[frontier_returns[optimal_weights]],
+            mode='markers+text',
+            text="Optimal",
+            marker=dict(size=20, color='#FF6384'),
+            name="Optimal Portfolio"
+        ))
+    else:
+        fig.add_trace(go.Scatter(
+            x=[frontier_volatilities[optimal_weights[0]]],
+            y=[frontier_returns[optimal_weights[1]]],
+            mode='markers+text',
+            text="Optimal",
+            marker=dict(size=20, color='#FF6384'),
+            name="Optimal Portfolio"
+        ))
+    
+    # Update layout
+    fig.update_layout(
+        title="Efficient Frontier",
+        xaxis_title="Annual Volatility",
+        yaxis_title="Annual Return (%)",
+        legend=dict(yanchor='bottom', xanchor='right', x=1, y=0.5)
+    )
+    
+    return fig
+
+
+def plot_weight_distribution(weights):
+    """Plot weight distribution as a pie chart."""
+    labels = list(weights.keys())
+    values = [weights[label] for label in labels]
+    
+    fig = go.Figure()
+    fig.add_trace(go.Pie(
+        labels=labels, 
+        values=values, 
+        hole=0.5,
+        textinfo="percent+label",
+        marker=dict(colors=["#FF6384", "#37479D", "#2CA02C", "#A1523D"])
+    ))
+    
+    fig.update_layout(
+        title="Portfolio Weight Distribution",
+        showlegend=False
+    )
+    
+    return fig
+
+
+def plot_drawdown(max_drawdown, cumulative_returns):
+    """Plot maximum drawdown."""
+    fig = go.Figure()
+    
+    # Calculate rolling max and drawdown
+    rolling_max = cumulative_returns.cummax()
+    drawdown = (cumulative_returns - rolling_max) / rolling_max
+    
+    fig.add_trace(go.Scatter(
+        x=drawdown.index, 
+        y=drawdown.values, 
+        mode='lines',
+        line=dict(color='#FF6384'),
+        name="Drawdown")
+    )
+    
+    fig.update_layout(
+        title=f"Maximum Drawdown: {max_drawdown:.2f}%",
+        xaxis_title="Date",
+        yaxis_title="Drawdown (%)",
+        hovermode='x unified'
+    )
+    
+    return fig
+
+
+def display_portfolio_metrics(metrics, max_drawdown):
+    """Display portfolio metrics in a formatted way."""
+    st.sidebar.header("Portfolio Metrics")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Annual Return", f"{metrics['Annual Return']:.2f}%")
+        st.metric("Volatility", f"{metrics['Volatility']:.2f}%")
+    
+    col3, col4 = st.columns(2)
+    with col3:
+        st.metric("Sharpe Ratio", f"{metrics['Sharpe Ratio']:.2f}")
+        st.metric("Max Drawdown", f"{max_drawdown:.2f}%")
+
+
+def main():
+    """Main dashboard function."""
+    
+    # Get user selections
+    assets = asset_names
+    
+    if start_date > end_date:
+        st.error("Start date cannot be after end date!")
+        return
+    
+    # Fetch data
+    prices = fetch_data(assets, start_date, end_date)
+    
+    if prices.empty:
+        st.error("No data retrieved. Please try again.")
+        return
+    
+    # Calculate returns
+    daily_returns = calculate_returns(prices)
+    
+    # Display basic info
+    st.subheader(f"Dataset Overview ({len(assets)} assets)")
+    st.dataframe(daily_returns.head())
+    
+    # Display individual asset metrics
+    st.subheader("Individual Asset Metrics")
+    asset_metrics = []
+    for ticker in daily_returns.index:
+        return_val = daily_returns[ticker].mean() * 252
+        vol_val = daily_returns[ticker].std() * np.sqrt(252)
+        
+        # Calculate beta
+        betas = calculate_betas(daily_returns)
+        beta = betas.get(ticker, 0) if 'betas' in locals() else 0
+        
+        asset_metrics.append({
+            "Asset": ticker,
+            "Annual Return": f"{return_val:.2f}%",
+            "Volatility": f"{vol_val:.2f}%",
+            "Beta": f"{beta:.2f}"
+        })
+    
+    st.dataframe(pd.DataFrame(asset_metrics))
+    
+    # Display portfolio metrics section
+    st.divider()
+    display_portfolio_metrics(metrics)
+    
+    # Plot individual asset risk-return characteristics
+    fig_risk_return = plot_risk_return_scatter(daily_returns, weights)
+    st.plotly_chart(fig_risk_return, use_container_width=True)
+    
+    # Generate efficient frontier
+    try:
+        frontier_returns, frontier_volatilities, frontier_weights = efficient_frontier(daily_returns)
+        
+        if len(frontier_returns) > 0:
+            fig_efficient = plot_efficient_frontier(
+                daily_returns, 
+                frontier_returns, 
+                frontier_volatilities, 
+                optimal_weights
+            )
+            st.plotly_chart(fig_efficient, use_container_width=True)
+            
+            # Plot weight distribution
+            fig_weights = plot_weight_distribution(weights)
+            st.plotly_chart(fig_weights, use_container_width=True)
+            
+        else:
+            st.error("Could not calculate efficient frontier. Please try with more assets.")
+    
+    except Exception as e:
+        st.error(f"Error in efficient frontier calculation: {str(e)}")
+
+
+if __name__ == "__main__":
+    main()
